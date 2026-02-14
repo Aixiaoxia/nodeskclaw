@@ -6,7 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
-import { LogOut, User, Package, Save, Plug, Loader2 } from 'lucide-vue-next'
+import { LogOut, User, Package, Save, Plug, Loader2, Lock, Globe, HardDrive } from 'lucide-vue-next'
 import { toast } from 'vue-sonner'
 import api from '@/services/api'
 
@@ -15,7 +15,10 @@ const router = useRouter()
 
 // ── 镜像仓库配置 ──
 const registryUrl = ref('')
-const registryUrlDirty = ref(false)
+const registryUsername = ref('')
+const registryPassword = ref('')
+const registryHasPassword = ref(false)
+const registryDirty = ref(false)
 const registrySaving = ref(false)
 const registryTesting = ref(false)
 const registryTags = ref<string[]>([])
@@ -36,7 +39,15 @@ async function loadSettings() {
     const res = await api.get('/settings')
     const data = res.data.data as Record<string, string | null>
     registryUrl.value = data.image_registry || ''
-    registryUrlDirty.value = false
+    registryUsername.value = data.registry_username || ''
+    // 密码后端返回 "******" 表示已配置
+    registryHasPassword.value = data.registry_password === '******'
+    registryPassword.value = ''
+    registryDirty.value = false
+    // 网络路由配置
+    ingressBaseDomain.value = data.ingress_base_domain || ''
+    tlsSecretName.value = data.tls_secret_name || ''
+    networkDirty.value = false
   } catch {
     // 首次可能没有配置，不报错
   } finally {
@@ -44,15 +55,26 @@ async function loadSettings() {
   }
 }
 
-/** 保存镜像仓库地址到数据库 */
+/** 保存镜像仓库全部配置到数据库 */
 async function handleSaveRegistry() {
   registrySaving.value = true
   try {
-    await api.put('/settings/image_registry', {
-      value: registryUrl.value.trim() || null,
-    })
-    registryUrlDirty.value = false
-    toast.success('镜像仓库地址已保存')
+    // 并行保存三项配置
+    const promises = [
+      api.put('/settings/image_registry', { value: registryUrl.value.trim() || null }),
+      api.put('/settings/registry_username', { value: registryUsername.value.trim() || null }),
+    ]
+    // 密码只在用户填了新值时才保存（空值 = 不修改已有密码）
+    if (registryPassword.value) {
+      promises.push(api.put('/settings/registry_password', { value: registryPassword.value }))
+    }
+    await Promise.all(promises)
+    registryDirty.value = false
+    registryPassword.value = ''
+    if (registryUsername.value.trim()) {
+      registryHasPassword.value = true
+    }
+    toast.success('镜像仓库配置已保存')
     // 保存后自动测试连接
     await handleTestRegistry()
   } catch {
@@ -89,9 +111,80 @@ async function handleTestRegistry() {
   }
 }
 
-function onRegistryInput(val: string | number) {
-  registryUrl.value = String(val)
-  registryUrlDirty.value = true
+function onRegistryFieldChange() {
+  registryDirty.value = true
+}
+
+// ── 网络路由配置 ──
+const ingressBaseDomain = ref('')
+const tlsSecretName = ref('')
+const networkDirty = ref(false)
+const networkSaving = ref(false)
+
+function onNetworkFieldChange() {
+  networkDirty.value = true
+}
+
+async function handleSaveNetwork() {
+  networkSaving.value = true
+  try {
+    await Promise.all([
+      api.put('/settings/ingress_base_domain', { value: ingressBaseDomain.value.trim() || null }),
+      api.put('/settings/tls_secret_name', { value: tlsSecretName.value.trim() || null }),
+    ])
+    networkDirty.value = false
+    toast.success('网络路由配置已保存')
+  } catch {
+    toast.error('保存失败')
+  } finally {
+    networkSaving.value = false
+  }
+}
+
+// ── 存储配置 ──
+interface StorageClassItem {
+  name: string
+  provisioner: string
+  reclaim_policy: string | null
+  allow_volume_expansion: boolean
+  is_default: boolean
+  enabled: boolean
+}
+const storageClasses = ref<StorageClassItem[]>([])
+const storageLoading = ref(false)
+const storageSaving = ref(false)
+
+async function loadStorageClasses() {
+  storageLoading.value = true
+  try {
+    // scope=all 获取集群全部 SC（含 enabled 状态）
+    const res = await api.get('/storage-classes', { params: { scope: 'all' } })
+    storageClasses.value = res.data.data as StorageClassItem[]
+  } catch {
+    storageClasses.value = []
+  } finally {
+    storageLoading.value = false
+  }
+}
+
+async function toggleStorageClass(scName: string) {
+  const sc = storageClasses.value.find((s) => s.name === scName)
+  if (!sc) return
+  sc.enabled = !sc.enabled
+  await saveAllowedStorageClasses()
+}
+
+async function saveAllowedStorageClasses() {
+  storageSaving.value = true
+  try {
+    const enabledNames = storageClasses.value.filter((s) => s.enabled).map((s) => s.name)
+    await api.put('/settings/allowed_storage_classes', { value: JSON.stringify(enabledNames) })
+    toast.success('存储配置已保存')
+  } catch {
+    toast.error('保存失败')
+  } finally {
+    storageSaving.value = false
+  }
 }
 
 onMounted(async () => {
@@ -100,6 +193,8 @@ onMounted(async () => {
   if (registryUrl.value.trim()) {
     await handleTestRegistry()
   }
+  // 加载可用 StorageClass
+  await loadStorageClasses()
 })
 </script>
 
@@ -158,39 +253,69 @@ onMounted(async () => {
         <!-- 地址输入 -->
         <div>
           <label class="text-sm font-medium mb-1.5 block">仓库地址</label>
-          <div class="flex gap-2">
-            <Input
-              :model-value="registryUrl"
-              placeholder="如：registry.example.com/org/image"
-              class="flex-1 font-mono text-sm"
-              :disabled="settingsLoading"
-              @update:model-value="onRegistryInput"
-            />
-            <Button
-              variant="outline"
-              size="sm"
-              :disabled="registryTesting || !registryUrl.trim()"
-              class="shrink-0"
-              @click="handleTestRegistry"
-            >
-              <Loader2 v-if="registryTesting" class="w-3.5 h-3.5 mr-1 animate-spin" />
-              <Plug v-else class="w-3.5 h-3.5 mr-1" />
-              测试连接
-            </Button>
-            <Button
-              size="sm"
-              :disabled="registrySaving || !registryUrlDirty"
-              class="shrink-0"
-              @click="handleSaveRegistry"
-            >
-              <Loader2 v-if="registrySaving" class="w-3.5 h-3.5 mr-1 animate-spin" />
-              <Save v-else class="w-3.5 h-3.5 mr-1" />
-              保存
-            </Button>
-          </div>
+          <Input
+            v-model="registryUrl"
+            placeholder="如：registry.example.com/namespace/repo"
+            class="font-mono text-sm"
+            :disabled="settingsLoading"
+            @update:model-value="onRegistryFieldChange"
+          />
           <p class="text-xs text-muted-foreground mt-1">
-            Docker Registry v2 地址，如 https://registry.example.com/org/image
+            Docker Registry v2 地址，如 <YOUR_REGISTRY>/<YOUR_NAMESPACE>/clawbuddy-base
           </p>
+        </div>
+
+        <!-- 认证凭证 -->
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-sm font-medium mb-1.5 block">用户名</label>
+            <Input
+              v-model="registryUsername"
+              placeholder="Registry 用户名"
+              class="font-mono text-sm"
+              :disabled="settingsLoading"
+              @update:model-value="onRegistryFieldChange"
+            />
+          </div>
+          <div>
+            <label class="text-sm font-medium mb-1.5 block">
+              密码
+              <span v-if="registryHasPassword" class="text-xs text-muted-foreground font-normal ml-1">
+                (已配置，留空不修改)
+              </span>
+            </label>
+            <Input
+              v-model="registryPassword"
+              type="password"
+              :placeholder="registryHasPassword ? '留空不修改' : 'Registry 密码'"
+              class="font-mono text-sm"
+              :disabled="settingsLoading"
+              @update:model-value="onRegistryFieldChange"
+            />
+          </div>
+        </div>
+
+        <!-- 操作按钮 -->
+        <div class="flex gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            :disabled="registryTesting || !registryUrl.trim()"
+            @click="handleTestRegistry"
+          >
+            <Loader2 v-if="registryTesting" class="w-3.5 h-3.5 mr-1 animate-spin" />
+            <Plug v-else class="w-3.5 h-3.5 mr-1" />
+            测试连接
+          </Button>
+          <Button
+            size="sm"
+            :disabled="registrySaving || !registryDirty"
+            @click="handleSaveRegistry"
+          >
+            <Loader2 v-if="registrySaving" class="w-3.5 h-3.5 mr-1 animate-spin" />
+            <Save v-else class="w-3.5 h-3.5 mr-1" />
+            保存
+          </Button>
         </div>
 
         <!-- 连接状态 -->
@@ -223,6 +348,112 @@ onMounted(async () => {
           <span class="w-2 h-2 rounded-full bg-red-400 inline-block" />
           {{ registryError }}
         </div>
+      </CardContent>
+    </Card>
+
+    <!-- 网络路由 -->
+    <Card>
+      <CardHeader>
+        <CardTitle class="flex items-center gap-2">
+          <Globe class="w-5 h-5" />
+          网络路由
+        </CardTitle>
+      </CardHeader>
+      <CardContent class="space-y-4">
+        <p class="text-xs text-muted-foreground">
+          配置子域名自动路由，部署实例时自动生成 Ingress 规则（如 instance.nodesk.tech）
+        </p>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-sm font-medium mb-1.5 block">基础域名</label>
+            <Input
+              v-model="ingressBaseDomain"
+              placeholder="如：nodesk.tech"
+              class="font-mono text-sm"
+              :disabled="settingsLoading"
+              @update:model-value="onNetworkFieldChange"
+            />
+            <p class="text-xs text-muted-foreground mt-1">
+              需提前配置 DNS 泛解析 *.域名 指向负载均衡器
+            </p>
+          </div>
+          <div>
+            <label class="text-sm font-medium mb-1.5 block">TLS Secret 名称</label>
+            <Input
+              v-model="tlsSecretName"
+              placeholder="如：wildcard-nodesk-tls"
+              class="font-mono text-sm"
+              :disabled="settingsLoading"
+              @update:model-value="onNetworkFieldChange"
+            />
+            <p class="text-xs text-muted-foreground mt-1">
+              K8s 中通配符证书 Secret 的名称
+            </p>
+          </div>
+        </div>
+        <div class="flex gap-2">
+          <Button
+            size="sm"
+            :disabled="networkSaving || !networkDirty"
+            @click="handleSaveNetwork"
+          >
+            <Loader2 v-if="networkSaving" class="w-3.5 h-3.5 mr-1 animate-spin" />
+            <Save v-else class="w-3.5 h-3.5 mr-1" />
+            保存
+          </Button>
+        </div>
+        <div v-if="ingressBaseDomain" class="text-xs text-muted-foreground bg-muted/30 rounded-lg p-3">
+          实例部署后访问地址示例：<span class="font-mono text-foreground">https://&lt;instance-name&gt;.{{ ingressBaseDomain }}</span>
+        </div>
+      </CardContent>
+    </Card>
+
+    <!-- 存储配置 -->
+    <Card>
+      <CardHeader>
+        <CardTitle class="flex items-center gap-2">
+          <HardDrive class="w-5 h-5" />
+          存储配置
+        </CardTitle>
+      </CardHeader>
+      <CardContent class="space-y-4">
+        <p class="text-xs text-muted-foreground">
+          集群中的 StorageClass 列表。只有启用的才会出现在部署页的存储选择中。
+        </p>
+        <div v-if="storageLoading" class="text-sm text-muted-foreground">加载中...</div>
+        <div v-else-if="storageClasses.length === 0" class="text-sm text-muted-foreground">
+          未获取到 StorageClass（需先连接集群并创建 StorageClass）
+        </div>
+        <div v-else class="space-y-2">
+          <div
+            v-for="sc in storageClasses"
+            :key="sc.name"
+            class="flex items-center justify-between rounded-md px-4 py-3 transition-colors"
+            :class="sc.enabled ? 'bg-primary/5 border border-primary/20' : 'bg-muted/30'"
+          >
+            <div>
+              <div class="text-sm font-mono font-medium">
+                {{ sc.name }}
+                <Badge v-if="sc.is_default" variant="outline" class="ml-2 text-xs">集群默认</Badge>
+              </div>
+              <div class="text-xs text-muted-foreground mt-0.5">
+                {{ sc.provisioner }} · 回收策略: {{ sc.reclaim_policy || '-' }} · 扩容: {{ sc.allow_volume_expansion ? '支持' : '不支持' }}
+              </div>
+            </div>
+            <Button
+              :variant="sc.enabled ? 'default' : 'outline'"
+              size="sm"
+              :disabled="storageSaving"
+              @click="toggleStorageClass(sc.name)"
+            >
+              {{ sc.enabled ? '已启用' : '启用' }}
+            </Button>
+          </div>
+        </div>
+        <p class="text-xs text-muted-foreground bg-muted/30 rounded-lg p-3">
+          添加新存储类型：在 K8s 集群中 <span class="font-mono text-foreground">kubectl apply -f</span> 新的 StorageClass YAML，
+          刷新页面即可看到。模板文件见 <span class="font-mono text-foreground">claw-buddy-artifacts/k8s/</span>
+        </p>
       </CardContent>
     </Card>
 

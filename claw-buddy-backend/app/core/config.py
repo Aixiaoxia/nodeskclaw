@@ -29,7 +29,6 @@ class Settings(BaseSettings):
 
     # ── 云平台 ──────────────────────────────────────────
     VKE_SUBNET_ID: str = ""
-    IMAGE_REGISTRY: str = ""
 
     # ── CORS ─────────────────────────────────────────────
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
