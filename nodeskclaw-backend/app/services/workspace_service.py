@@ -496,6 +496,12 @@ async def update_agent(
         wa.label = data.label or None
     if data.theme_color is not None:
         wa.theme_color = data.theme_color
+        # Sync theme_color to NodeCard.metadata_.display_color (mirrors HumanHex update flow)
+        card = await node_card_service.get_node_card(db, node_id=inst.id, workspace_id=workspace_id)
+        if card:
+            meta = card.metadata_ or {}
+            meta["display_color"] = data.theme_color
+            await node_card_service.update_node_card(db, card, metadata=meta)
 
     position_changed = False
     old_q, old_r = wa.hex_q, wa.hex_r
