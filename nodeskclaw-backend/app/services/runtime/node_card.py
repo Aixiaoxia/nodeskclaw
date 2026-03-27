@@ -90,9 +90,11 @@ async def update_node_card(
     card: NodeCard,
     **kwargs,
 ) -> NodeCard:
+    from sqlalchemy.orm.attributes import flag_modified
     for key, value in kwargs.items():
         if key == "metadata":
             setattr(card, "metadata_", value)
+            flag_modified(card, "metadata_")
         elif hasattr(card, key):
             setattr(card, key, value)
     return card
